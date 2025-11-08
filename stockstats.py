@@ -452,7 +452,7 @@ class StockFrame:
     def _sync_backend_from_mirror(self) -> None:
         if self._mirror is None:
             return
-        pdf = pd.DataFrame(self._mirror)
+        pdf = self._mirror.to_pandas(copy=True)
         if isinstance(self._backend, PandasBackend):
             self._backend = PandasBackend(pdf)
             return
@@ -494,7 +494,7 @@ class StockFrame:
 
     def to_pandas(self) -> pd.DataFrame:
         mirror = self._ensure_mirror()
-        return pd.DataFrame(mirror)
+        return mirror.to_pandas(copy=True)
 
     def to_polars(self) -> 'pl.DataFrame':
         data = self._backend.data()
@@ -503,7 +503,7 @@ class StockFrame:
         if isinstance(data, pl.DataFrame):
             return data.clone()
         mirror = self._ensure_mirror()
-        frame = pd.DataFrame(mirror).reset_index().rename(columns={'index': self._index_column})
+        frame = mirror.to_pandas(copy=True).reset_index().rename(columns={'index': self._index_column})
         return _pl_from_pandas(frame)
 
     def copy(self, deep: bool = True) -> 'StockFrame':
@@ -513,7 +513,7 @@ class StockFrame:
         if isinstance(self._backend, PandasBackend):
             backend = PandasBackend(copied)
         elif isinstance(self._backend, PolarsBackend) and pl is not None:
-            polars_df = _pl_from_pandas(self._reset_index_frame(pd.DataFrame(copied)))
+            polars_df = _pl_from_pandas(self._reset_index_frame(copied.to_pandas(copy=True)))
             backend = PolarsBackend(polars_df)
         else:  # fallback for custom backends
             backend = self._backend.clone()
@@ -534,7 +534,7 @@ class StockFrame:
                         return self
                     backend = PandasBackend(result)
                     if isinstance(self._backend, PolarsBackend) and pl is not None:
-                        polars_df = _pl_from_pandas(self._reset_index_frame(pd.DataFrame(result)))
+                        polars_df = _pl_from_pandas(self._reset_index_frame(result.to_pandas(copy=True)))
                         backend = PolarsBackend(polars_df)
                         return StockFrame(backend,
                                           index_column=self._index_column,
@@ -560,7 +560,7 @@ class StockFrame:
             mirror_df = StockDataFrame(normalized)
             return df, mirror_df
         if isinstance(df, StockDataFrame):  # type: ignore[name-defined]
-            return PandasBackend(df), df
+            return df.backend, df
         if isinstance(df, pd.DataFrame):
             normalized = _normalize_pandas_frame(df, index_column)
             mirror_df = StockDataFrame(normalized)
@@ -729,26 +729,12 @@ def unwrap(sdf):
         if pl is not None and isinstance(backend_data, pl.DataFrame):
             return _pl_to_pandas(backend_data)
         raise TypeError(f'Unsupported backend type: {type(backend_data)!r}')
+    if isinstance(sdf, StockDataFrame):
+        return sdf.to_pandas(copy=True)
     return pd.DataFrame(sdf)
 
 
-class StockStatsCore:
-    """Mixin holding backend plumbing shared by pandas and polars variants."""
-
-    def __init__(self, backend: Backend):
-        self._backend: Backend = backend
-
-    @property
-    def backend(self) -> Backend:
-        return self._backend
-
-    def to_stock_frame(self) -> StockFrame:
-        """Represent this container as a StockFrame for backend-agnostic logic."""
-
-        return StockFrame(self._backend)
-
-
-class StockDataFrame(pd.DataFrame, StockStatsCore):
+class StockDataFrame:
     # Start of options.
     KDJ_PARAM = (2.0 / 3.0, 1.0 / 3.0)
 
@@ -764,11 +750,132 @@ class StockDataFrame(pd.DataFrame, StockStatsCore):
 
     # End of options
 
+    _INDEXER_NAMES = {'loc', 'iloc', 'iat', 'at'}
     _metadata = ['_backend']
 
-    def __init__(self, *args, **kwargs):
-        pd.DataFrame.__init__(self, *args, **kwargs)
-        StockStatsCore.__init__(self, PandasBackend(self))
+    def __init__(self, backend: Optional[str] = None, *args, **kwargs):
+        if isinstance(data, StockDataFrame):
+            pdf = data.to_pandas(copy=True)
+        elif isinstance(data, pd.DataFrame):
+            pdf = data
+        elif data is None:
+            pdf = pd.DataFrame()
+        else:
+            pdf = pd.DataFrame(data)
+        self._data = pdf
+        StockStatsCore.__init__(self, PandasBackend(self._data))
+
+    # -- Basic dataframe plumbing -------------------------------------------------
+    def __repr__(self) -> str:
+        return repr(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __contains__(self, item: str) -> bool:
+        return item in self._data
+
+    def __dataframe__(self, *args, **kwargs):
+        if hasattr(self._data, '__dataframe__'):
+            return self._data.__dataframe__(*args, **kwargs)  # type: ignore[attr-defined]
+        return self._data
+
+    def __array__(self, dtype=None):
+        return np.asarray(self._data, dtype=dtype)
+
+    def _wrap_result(self, value):
+        if isinstance(value, pd.DataFrame):
+            return StockDataFrame(value.copy(deep=True))
+        return value
+
+    def __getattribute__(self, item):
+        try:
+            return object.__getattribute__(self, item)
+        except AttributeError:
+            data = object.__getattribute__(self, '_data')
+            if hasattr(data, item):
+                attr = getattr(data, item)
+                indexers = object.__getattribute__(self, '_INDEXER_NAMES')
+                if item in indexers:
+                    return attr
+                if callable(attr):
+                    wrap_result = object.__getattribute__(self, '_wrap_result')
+
+                    @functools.wraps(attr)
+                    def wrapper(*args, **kwargs):
+                        result = attr(*args, **kwargs)
+                        return wrap_result(result)
+
+                    return wrapper
+                if isinstance(attr, pd.DataFrame):
+                    return StockDataFrame(attr.copy(deep=True))
+                return attr
+            raise
+
+    @property
+    def columns(self):
+        return self._data.columns
+
+    @columns.setter
+    def columns(self, value):
+        self._data.columns = value
+
+    @property
+    def index(self):
+        return self._data.index
+
+    @index.setter
+    def index(self, value):
+        self._data.index = value
+
+    @property
+    def empty(self) -> bool:
+        return self._data.empty
+
+    def keys(self):
+        return self._data.keys()
+
+    def to_pandas(self, copy: bool = True) -> pd.DataFrame:
+        if copy:
+            return self._data.copy(deep=True)
+        return self._data
+
+    # -- pandas-like operators ----------------------------------------------------
+    def __getitem__(self, item):
+        try:
+            result = wrap(self._data.__getitem__(item))
+        except KeyError:
+            try:
+                if isinstance(item, list):
+                    for column in item:
+                        self.__init_column(column)
+                else:
+                    self.__init_column(item)
+            except AttributeError:
+                pass
+            result = wrap(self._data.__getitem__(item))
+        return result
+
+    def __setitem__(self, key, value):
+        self._data.__setitem__(key, value)
+
+    def __delitem__(self, key):
+        del self._data[key]
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def copy(self, deep=True):
+        return StockDataFrame(self._data.copy(deep=deep))
+
+    def to_dict(self, *args, **kwargs):
+        return self._data.to_dict(*args, **kwargs)
 
     @staticmethod
     def _df_to_series(column):
@@ -1484,18 +1591,47 @@ class StockDataFrame(pd.DataFrame, StockStatsCore):
                                  adjust=adjust,
                                  min_periods=min_periods)
 
-    def roc(self, series, size):
-        backend = self.backend
-        diff = backend.diff(series, size)
-        shifted = backend.shift(series, size)
-        result = diff / shifted
-        arr = backend.to_numpy(result).copy()
-        if size < 0:
-            arr[size:] = 0
+    def roc(self, series=None, size=None):
+        if isinstance(self, StockDataFrame):
+            target = series
+            periods = size
+            backend: Optional[Backend] = self.backend
         else:
-            arr[:size] = 0
+            target = self
+            periods = series if size is None else size
+            backend = None
+        if target is None or periods is None:
+            raise TypeError('roc() missing required arguments')
+        if backend is not None:
+            diff = backend.diff(target, periods)
+            shifted = backend.shift(target, periods)
+            result = diff / shifted
+            arr = backend.to_numpy(result).copy()
+        else:
+            if isinstance(target, pd.Series):
+                diff = target.diff(periods)
+                shifted = target.shift(periods)
+                result = diff / shifted
+                arr = result.to_numpy(copy=True)
+            elif pl is not None and isinstance(target, pl.Series):
+                diff = target.diff(n=periods)
+                shifted = target.shift(periods)
+                result = diff / shifted
+                arr = result.to_numpy()
+            else:
+                raise TypeError('Unsupported series type for roc without backend')
+        if periods < 0:
+            arr[periods:] = 0
+        else:
+            arr[:periods] = 0
         arr *= 100
-        return backend.from_numpy(arr, like=result)
+        if backend is not None:
+            return backend.from_numpy(arr, like=result)
+        if isinstance(target, pd.Series):
+            return pd.Series(arr, index=target.index, name=target.name)
+        if pl is not None and isinstance(target, pl.Series):
+            return pl.Series(name=target.name, values=arr)
+        return arr
 
     @classmethod
     def _mad(cls, series, window):
@@ -1549,22 +1685,51 @@ class StockDataFrame(pd.DataFrame, StockStatsCore):
     def _rolling(series: pd.Series, window: int):
         return series.rolling(window, min_periods=1, center=False)
 
-    def linear_wma(self, series, window):
-        weights = np.arange(1, window + 1, dtype=float)
+    def linear_wma(self, series=None, window=None):
+        if isinstance(self, StockDataFrame):
+            target = series
+            size = window
+            backend: Optional[Backend] = self.backend
+        else:
+            target = self
+            size = series if window is None else window
+            backend = None
+        if target is None or size is None:
+            raise TypeError('linear_wma() missing required arguments')
+        weights = np.arange(1, size + 1, dtype=float)
         norm = weights.sum()
-        backend = self.backend
-        arr = backend.to_numpy(series).astype(float, copy=False)
+        if backend is not None:
+            arr = backend.to_numpy(target).astype(float, copy=False)
+        elif isinstance(target, pd.Series):
+            arr = target.to_numpy(dtype=float, copy=False)
+        elif pl is not None and isinstance(target, pl.Series):
+            arr = target.to_numpy()
+            arr = arr.astype(float, copy=False)
+        else:
+            arr = np.asarray(target, dtype=float)
         out = np.zeros_like(arr, dtype=float)
         n = arr.size
         if n == 0:
-            return backend.from_numpy(out, like=series)
-        if window <= 0:
+            if backend is not None:
+                return backend.from_numpy(out, like=target)
+            if isinstance(target, pd.Series):
+                return pd.Series(out, index=target.index, name=target.name)
+            if pl is not None and isinstance(target, pl.Series):
+                return pl.Series(name=target.name, values=out)
+            return out
+        if size <= 0:
             raise StockStatsError('window must be greater than 0')
-        start = window - 1
+        start = size - 1
         for idx in range(start, n):
-            window_slice = arr[idx - window + 1:idx + 1]
+            window_slice = arr[idx - size + 1:idx + 1]
             out[idx] = np.dot(window_slice, weights) / norm
-        return backend.from_numpy(out, like=series)
+        if backend is not None:
+            return backend.from_numpy(out, like=target)
+        if isinstance(target, pd.Series):
+            return pd.Series(out, index=target.index, name=target.name)
+        if pl is not None and isinstance(target, pl.Series):
+            return pl.Series(name=target.name, values=out)
+        return out
 
     @classmethod
     def linear_reg(cls,
@@ -2482,21 +2647,6 @@ class StockDataFrame(pd.DataFrame, StockStatsCore):
             else:
                 self.__init_not_exist_column(key)
 
-    def __getitem__(self, item):
-        try:
-            result = wrap(super(StockDataFrame, self).__getitem__(item))
-        except KeyError:
-            try:
-                if isinstance(item, list):
-                    for column in item:
-                        self.__init_column(column)
-                else:
-                    self.__init_column(item)
-            except AttributeError:
-                pass
-            result = wrap(super(StockDataFrame, self).__getitem__(item))
-        return result
-
     def till(self, end_date):
         return self[self.index <= end_date]
 
@@ -2505,10 +2655,6 @@ class StockDataFrame(pd.DataFrame, StockStatsCore):
 
     def within(self, start_date, end_date):
         return self.start_from(start_date).till(end_date)
-
-    # noinspection PyFinal
-    def copy(self, deep=True):
-        return wrap(super(StockDataFrame, self).copy(deep))
 
     @staticmethod
     def _ensure_type(obj):
